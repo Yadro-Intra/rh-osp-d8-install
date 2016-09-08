@@ -1,5 +1,5 @@
 #!/bin/bash
-
+echo 'Chapter 4. Installing the Undercloud'>&2
 echo "4.7. Obtaining Images for Overcloud Nodes">&2
 echo >&2
 
@@ -49,7 +49,8 @@ run openstack overcloud image upload --image-path "$home/images/" \
 
 openstack image list
 for img in	bm-deploy-kernel bm-deploy-ramdisk \
-		overcloud-full overcloud-full-initrd overcloud-full-vmlinuz
+		overcloud-full overcloud-full-initrd \
+		overcloud-full-vmlinuz
 do
 	openstack image list | grep -wq "$img" && echo "'$img' ok" || error 1 "No '$img' image."
 done >&2
