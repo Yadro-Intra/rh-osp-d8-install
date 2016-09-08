@@ -1,0 +1,44 @@
+#!/bin/bash
+echo 'Chapter 4. Installing the Undercloud'>&2
+echo '4.2. Creating Directories for Templates and Images'>&2
+echo ''>&2
+
+error () {
+	local -i rc=$1
+	shift
+	echo "ERROR($rc): $@">&2
+	exit $rc
+}
+
+run () {
+	local r='' p="$@"
+
+	if [ "$NOPAUSE" = 'yes' ]; then
+		echo "Run [$p] (no pause)">&2
+	else
+		read -p "Run [$p] " r
+		case "$r" in
+		c*|C*)	error 0 "Cancelled";;
+		a*|A*)	error 0 "Aborted.";;
+		n*|N*)	echo "Skipped.">&2; return 0;;
+		y*|Y*)	;;
+		esac
+	fi
+	"$@"
+}
+
+[ -w /etc/passwd ] && error 1 "Don't run me as root. User 'stack' instead."
+[ "$(id -nu)" = 'stack' ] || error 1 "Run me as user 'stack' please."
+
+cd ~stack || error $? "No home?"
+home=$(pwd)
+
+for dir in images templates; do
+	[ -d "$home/$dir/." ] && { echo "Directory '$home/$dir' already here.">&2; continue; }
+	run mkdir "$home/$dir" || error $? "Cannot create dir '$dir' in '$home'."
+done
+
+echo ''>&2
+echo 'Done.'>&2
+echo ''>&2
+# EOF #
