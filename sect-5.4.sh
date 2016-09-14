@@ -74,9 +74,18 @@ get_first () {
 	| grep -wom1 "\"$field\":[[:space:]]*\"[^\"]\\+\""
 }
 
+# Use only these fields to identify disk:
+#    model (String): Device identifier.
+#    vendor (String): Device vendor.
+#    serial (String): Disk serial number.	<< DEFAULT
+#    wwn (String): Unique storage identifier.
+#    hctl (String): Host:Channel:Target:Lun for SCSI.
+#    size (Integer): Size of the device in GB. 
+FIELD=serial
+
 assign_root_device () {
 	local node="$1"
-	local dev=$(get_first serial "$node")
+	local dev=$(get_first $FIELD "$node")
 
 	run ironic node-update "$node" add "properties/root_device={$dev}"
 }
