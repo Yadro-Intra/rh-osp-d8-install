@@ -64,6 +64,7 @@ subjectAltName = @alt_names
 class Global:
 	SE_level = None
 	use_pause = False
+	test_only = False
 #end class Global
 
 G = Global()
@@ -121,6 +122,8 @@ class ConfigParser:
 		'''Like .raw_get() but deals with "$name" substitutions.
 		'''
 		value = self.raw_get(section, name)
+		if not value :
+			return None
 		while '$' in value :
 			i = value.index('$') + 1
 			v = ''
@@ -474,10 +477,14 @@ def check_undercloud_config():
 	# because there is no AI to guess them right.
 
 	srv_cert = ucf.get('DEFAULT', 'undercloud_service_certificate')
+	if not srv_cert :
+		error(1, "undercloud unconfigured: undercloud_service_certificate")
 	logging.info('%s:undercloud_service_certificate=%s', ucf._filename, `srv_cert`)
 	exists(os.path.dirname(srv_cert))	# you have to 'sudo mkdir' it first.
 
 	image_path = ucf.get('DEFAULT', 'image_path')
+	if not image_path :
+		error(1, "undercloud unconfigured: image_path")
 	logging.info('%s:image_path=%s', ucf._filename, `image_path`)
 	mkpath(image_path) # this is supposed to be in stack's home - no sudo
 
@@ -588,7 +595,7 @@ def install_certs():
 
 def can_connect(addr, port):
 	try:
-		socket.create_connection((addr, port)).close()
+		socket.create_connection((addr, port), timeout=3).close()
 		logging.debug('can_connect(%s, %s): True', `addr`, `port`)
 		return True
 	except:
@@ -616,14 +623,17 @@ def main():
 	try:
 		opts, args = getopt.getopt(
 			sys.argv[1:],
-			'?hpd',
-			('help', 'pause', 'debug')
+			'?hpdt',
+			('help', 'pause', 'debug', 'test')
 		)
 		for o,v in opts:
 			if o in ('-h', '--help'):
 				print('-p, --pause -- stop after each step')
 				print('-d, --debug -- use DEBUG level of logging')
+				print('-t, --test -- do not generate, just test installed')
 				return 0
+			elif o in ('-t', '--test'):
+				G.test_only = True
 			elif o in ('-p', '--pause'):
 				G.use_pause = True
 			elif o in ('-d', '--debug'):
@@ -637,18 +647,22 @@ def main():
 
 	setup()
 	try:
-		check()
-		make_config()
+		if G.test_only :
+			logging.info('Only tests will be performed!')
+			check()
+		else:
+			check()
+			make_config()
 
-		fix_etc_files()
+			fix_etc_files()
 
-		gen_ca()
-		install_ca()
+			gen_ca()
+			install_ca()
 
-		fix_ca_install()
+			fix_ca_install()
 
-		gen_certs()
-		install_certs()
+			gen_certs()
+			install_certs()
 
 		if can_connect(values['public_api_ip'], 13000):
 			url = 'https://%(public_api_ip)s:13000/v3/auth/tokens' % values
