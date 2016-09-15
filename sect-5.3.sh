@@ -56,12 +56,12 @@ nrules=$(openstack baremetal introspection rule list | grep -v '^[[:space:]]*$' 
 
 openstack overcloud profiles list
 
-# I have no ceph-storage
+# I have no ceph-storage; 'boot_option:local' looks a must here.
 declare roles=(
 	'compute,boot_option:local'
 	'control,boot_option:local'
-	'swift-storage'
-	'block-storage'
+	'swift-storage,boot_option:local'
+	'block-storage,boot_option:local'
 )
 
 declare -i ri=0 # role index
