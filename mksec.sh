@@ -146,6 +146,36 @@ run () {
 	"\$@"
 }
 
+confirm () {
+        local rep=''
+        local prompt='Press <RETURN> to continue...'
+        [ -n "\$1" ] && prompt="\$@"
+        while :; do
+                read -p "\$prompt" rep
+                case "\$rep" in
+                y*|Y*) return 0;;
+                n*|N*) return 1;;
+                *) echo "Yes or No?">/dev/tty;;
+                esac
+        done
+}
+
+edit () {
+        local e="\$VISUAL"
+        [ -z "\$e" ] && e="\$EDITOR"
+        [ -z "\$e" ] && e=vi
+        "\$e" "\$@"
+}
+
+keep_env () {
+        local env="\$1"
+
+        [ -f "\$env" ] || error 1 "No env file '\$env'."
+        if ! grep -q "^\$env"'\$' "\$home/overcloud-extra-env.list"; then
+                echo "\$env" >> "\$home/overcloud-extra-env.list"
+        fi
+}
+
 [ -w /etc/passwd ] && error 1 "Don't run me as root. User 'stack' instead."
 [ "\$(id -nu)" = 'stack' ] || error 1 "Run me as user 'stack' please."
 
