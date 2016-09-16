@@ -1,5 +1,7 @@
 #!/bin/bash
 
+scriptDir=$(realpath `dirname $0`)
+
 error () {
 	local -i rc=$1
 	shift
@@ -24,6 +26,14 @@ run () {
 	"$@"
 }
 
+where_was () {
+	local text="$1" e=''
+
+	while read e; do
+		basename "$e" .sh | cut -d- -f2
+	done < <(grep -l "$text" $scriptDir/sect-*.sh)
+}
+
 [ -w /etc/passwd ] && error 1 "Don't run me as root. User 'stack' instead."
 [ "$(id -nu)" = 'stack' ] || error 1 "Run me as user 'stack' please."
 
@@ -35,12 +45,16 @@ xenv="$home/overcloud-extra-env.list"
 
 declare -a args=()
 
+echo "Extra custom templates will be used:">/dev/tty
 while read line; do
 	[ -f "$line" ] || { echo "No template '$line' - skipped.">/dev/tty; continue; }
 	args[${#args[*]}]="-e '$line'"
-	printf '%3d %s\n' ${#args[*]} "$line" >/dev/tty
+	n=$(basename "$line")
+	l=$(where_was "$n")
+	[ -z "$l" ] && l='manually added' || l="sections: $l"
+	printf '%3d %s (%s)\n' ${#args[*]} "$line" "$l" >/dev/tty
 done < "$xenv"
-echo "Templates listed and found: $i">/dev/tty
+echo "Templates listed and found: ${#args[*]}">/dev/tty
 
 # In 6.3.1 we read:
 # # Node placement takes priority over profile matching.
@@ -52,13 +66,15 @@ for k in control compute ceph-storage block-storage swift-storage; do
 	args[${#args[*]}]="--$k-flavor $FORCE_FLAVOR"
 done
 
+echo "Validating deployment...">/dev/tty
+openstack overcloud deploy --dry-run --validation-errors-fatal --validation-warnings-fatal \
+	--templates ${args[*]} || error $? "Validation error."
+
 N=''
 case "$1" in
 -n|--dry-run)	N='--dry-run';;
 esac
 
-openstack overcloud deploy --dry-run --validation-errors-fatal --validation-warnings-fatal \
-	--templates ${args[*]} || error $? "Validation error."
 [ -n "$N" ] && exit 0
 
 run openstack overcloud deploy --templates ${args[*]}
