@@ -73,8 +73,12 @@ echo "[$terra/$locus]" >/dev/tty
 
 cat -nA "$tzFile"
 
+if ! grep -q "^$tzFile"'$' "$home/overcloud-extra-env.list"; then
+	echo "$tzFile" >> "$home/overcloud-extra-env.list"
+fi
+
 while :; do
-	read -p 'Do you want to START OVERCLOUD DEPLOYMENT RIGHT NOW? '
+	read -p 'Do you want to START OVERCLOUD DEPLOYMENT RIGHT NOW to apply TZ change? '
 	case "$REPLY" in
 	n*|N*)	break;;
 	y*|Y*)	echo 'Ok, left intact.'>/dev/tty; exit 0;;
