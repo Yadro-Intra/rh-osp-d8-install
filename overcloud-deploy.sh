@@ -12,18 +12,45 @@ error () {
 run () {
 	local r='' p="$@"
 
+	{
+		echo -n "Run ["
+		echo -n "$p" | sed -e '1,$s/ -/ \\\n\t-/g'
+		echo -n "]"
+	}>/dev/tty
+
 	if [ "$NOPAUSE" = 'yes' ]; then
-		echo "Run [$p] (no pause)">&2
+		echo " (no pause)">/dev/tty
 	else
-		read -p "Run [$p] " r
+		read -p "? " r </dev/tty
 		case "$r" in
 		c*|C*)	error 0 "Cancelled";;
 		a*|A*)	error 0 "Aborted.";;
-		n*|N*)	echo "Skipped.">&2; return 0;;
+		n*|N*)	echo "Skipped."; return 0;;
 		y*|Y*)	;;
 		esac
-	fi
+	fi >/dev/tty
 	"$@"
+}
+
+confirm () {
+        local rep=''
+        local prompt='Press <RETURN> to continue...'
+        [ -n "$1" ] && prompt="$@"
+        while :; do
+                read -p "$prompt" rep </dev/tty
+                case "$rep" in
+                y*|Y*) return 0;;
+                n*|N*) return 1;;
+                *) echo "Yes or No?">/dev/tty;;
+                esac
+        done
+}
+
+edit () {
+        local e="$VISUAL"
+        [ -z "$e" ] && e="$EDITOR"
+        [ -z "$e" ] && e=vi
+        "$e" "$@"
 }
 
 where_was () {
@@ -42,42 +69,47 @@ home=$(pwd)
 xenv="$home/overcloud-extra-env.list"
 
 [ -f "$xenv" ] || error 1 "No overcloud extra env list. Do it yourself."
+confirm "Do you want to edit '$xenv'? " && edit "$xenv"
 
 declare -a args=()
 
 echo "Extra custom templates will be used:">/dev/tty
 while read line; do
 	[ -f "$line" ] || { echo "No template '$line' - skipped.">/dev/tty; continue; }
-	args[${#args[*]}]="-e '$line'"
 	n=$(basename "$line")
 	l=$(where_was "$n")
 	[ -z "$l" ] && l='manually added' || l="sections: $l"
-	printf '%3d %s (%s)\n' ${#args[*]} "$line" "$l" >/dev/tty
-done < "$xenv"
+	printf '%3d %s (%s)\n' $(( ${#args[*]} + 1 )) "$line" "$l" >/dev/tty
+	confirm "Use it? " && args[${#args[*]}]="-e $line"
+done < <(grep -v '#' <"$xenv")
 echo "Templates listed and found: ${#args[*]}">/dev/tty
-
-# In 6.3.1 we read:
-# # Node placement takes priority over profile matching.
-# # To avoid scheduling failures, use the default baremetal flavor for deployment
-# # and not the flavors designed for profile matching (compute, control, etc).
-# so...
-FORCE_FLAVOR=baremetal
-for k in control compute ceph-storage block-storage swift-storage; do
-	args[${#args[*]}]="--$k-flavor $FORCE_FLAVOR"
-done
 
 echo "Validating deployment...">/dev/tty
 openstack overcloud deploy --dry-run --validation-errors-fatal --validation-warnings-fatal \
 	--templates ${args[*]} || error $? "Validation error."
 
-N=''
+OP=''
+ARGS=''
+STACK=''
 case "$1" in
--n|--dry-run)	N='--dry-run';;
+'')		OP=deploy;;
+-n|--dry-run)	exit 0;;
+-u|--update)	OP='update stack'; ARGS='--interactive'; STACK='overcloud';;
 esac
 
-[ -n "$N" ] && exit 0
+if [ "$OP" = 'deploy' ]; then
+	# In 6.3.1 we read:
+	# # Node placement takes priority over profile matching.
+	# # To avoid scheduling failures, use the default baremetal flavor for deployment
+	# # and not the flavors designed for profile matching (compute, control, etc).
+	# so...
+	FORCE_FLAVOR=baremetal
+	for k in control compute ceph-storage block-storage swift-storage; do
+		args[${#args[*]}]="--$k-flavor $FORCE_FLAVOR"
+	done
+fi
 
-run openstack overcloud deploy --templates ${args[*]}
+run openstack overcloud $OP $ARGS --templates ${args[*]} $STACK
 
 echo ''>&2
 echo 'Done.'>&2
