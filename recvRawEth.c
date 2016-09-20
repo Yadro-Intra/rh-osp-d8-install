@@ -44,6 +44,9 @@ static struct {
 	int promisc_mode;
 	int dump_packet;
 	int max_packets;
+	int interesting;
+	int only;
+	int no_srv;
 } parm = {
 	.auto_exclude = 1,
 };
@@ -53,6 +56,11 @@ typedef uint32_t ipv4_addr_t;
 typedef char eth_mac_t[6];
 
 #define MAX_BAD_IP 32
+
+struct ipv4_cidr {
+	ipv4_addr_t ip;
+	int bits;
+};
 
 struct {
 	char ifName[IFNAMSIZ];
@@ -72,11 +80,20 @@ struct {
 	char local_ip_str[INET6_ADDRSTRLEN];
 	char local_mac_str[32];
 
-	ipv4_addr_t ignored_ip[MAX_BAD_IP];
+	struct ipv4_cidr ignored_ip[MAX_BAD_IP];
 	int ignored_ip_count;
 
 	eth_mac_t ignored_mac[MAX_BAD_IP];
 	int ignored_mac_count;
+
+	struct ipv4_cidr tracked_ip[MAX_BAD_IP];
+	int tracked_ip_count;
+
+	eth_mac_t tracked_mac[MAX_BAD_IP];
+	int tracked_mac_count;
+
+	unsigned short ignored_ports[MAX_BAD_IP];
+	int ignored_port_count;
 } global = {
 	.ifName = DEFAULT_IF,
 	.ignored_mac_count = 1, /* null MAC is always ignored */
@@ -85,17 +102,76 @@ struct {
 
 const eth_mac_t broadcast_mac = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
-static void add_ignored_ip(const char *ip)
+static int a2i(char *s)
 {
-	ipv4_addr_t addr;
-	int ret = inet_pton(AF_INET, ip, &addr);
+	char *p;
+	long int r;
 
-	if (global.ignored_ip_count >= MAX_BAD_IP)
+	errno = 0;
+	r = strtol(s, &p, 10);
+	if (errno) {
+		perror("strtol");
+		exit(EXIT_FAILURE);
+	}
+	if (r == 0L && p == s) {
+		fprintf(stderr, "Invalid decimal value '%s'.\n", s);
+		exit(EXIT_FAILURE);
+	}
+
+	return (int) r;
+}
+
+static void ipv4_to_str(ipv4_addr_t ip, char *s, size_t size)
+{
+	struct sockaddr_storage their_addr = {};
+
+	((struct sockaddr_in *)&their_addr)->sin_addr.s_addr = ip;
+	inet_ntop(AF_INET, &((struct sockaddr_in*)&their_addr)->sin_addr, s, size);
+}
+
+static char *ipv4_as_str(ipv4_addr_t ip)
+{
+	static char tmp[INET6_ADDRSTRLEN];
+
+	ipv4_to_str(ip, tmp, sizeof(tmp)-1);
+	return tmp;
+}
+
+static inline int ip_in_list(ipv4_addr_t ip, const struct ipv4_cidr *list, int list_size)
+{
+	int i;
+
+	for (i = 0; i < list_size; i++) {
+		uint32_t a = ip << (32 - list[i].bits);
+		uint32_t b = list[i].ip << (32 - list[i].bits);
+
+		if (a == b)
+			return 1;
+	}
+	return 0;
+}
+
+static void add_ip_to_list(const char *ip, struct ipv4_cidr *list, int *list_size)
+{
+	char tmp[INET6_ADDRSTRLEN], *p;
+	ipv4_addr_t addr;
+	int ret;
+
+	if (*list_size >= MAX_BAD_IP)
 		return;
+
+	strncpy(tmp, ip, sizeof(tmp)-1);
+	p = strchr(tmp, '/');
+	if (p)
+		*p++ = '\0';
+
+	ret = inet_pton(AF_INET, tmp, &addr);
 
 	switch (ret) {
 	case 1:
-		global.ignored_ip[global.ignored_ip_count++] = addr;
+		list[*list_size].bits = p ? a2i(p) : 32;
+		list[*list_size].ip = addr;
+		(*list_size)++;
 		return;
 	case 0:
 		fprintf(stderr, "Error: '%s' is not valid IPv4 address\n", ip);
@@ -109,15 +185,87 @@ static void add_ignored_ip(const char *ip)
 	}
 }
 
-static inline int is_ignored_ip(ipv4_addr_t ip)
+static void ignore_ports(char *arg)
 {
+	char *q, *p = arg;
+
+	while (global.ignored_port_count < MAX_BAD_IP) {
+		long int r;
+
+		errno = 0;
+		r = strtol(p, &q, 10);
+
+		if (errno || q == p) {
+			/* service name? */
+			struct servent *se;
+			q = strchr(p, ',');
+			if (q)
+				*q = '\0';
+			se = getservbyname(p, "tcp");
+			se = se ? se : getservbyname(p, "udp");
+			if (!se) {
+				fprintf(stderr, "Unknown service \"%s\".\n", p);
+				exit(EXIT_FAILURE);
+			}
+			if (q)
+				*q = ',';
+			r = ntohs(se->s_port);
+		}
+
+		/* r = port number */
+		global.ignored_ports[global.ignored_port_count++] = htons(r);
+		fprintf(stderr, "\tport %lu\n", r);
+
+		if (!q || !*q) break;
+
+		if (*q == ',') *q++ = '\0';
+		p = q;
+	}
+}
+
+static int ignored_port(const void *packet)
+{
+	const struct iphdr *ip = (struct iphdr *)
+		(packet + sizeof(struct ether_header));
+	const struct udphdr *udp = (struct udphdr *)
+		(packet + sizeof(struct iphdr) + sizeof(struct ether_header));
 	int i;
 
-	for (i = 0; i < global.ignored_ip_count; i++) {
-		if (ip ==  global.ignored_ip[i])
+	if (ip->protocol != IPPROTO_TCP && ip->protocol != IPPROTO_UDP)
+		return 0;
+
+	for (i = 0; i < global.ignored_port_count; i++) {
+		if (	global.ignored_ports[i] == udp->source ||
+			global.ignored_ports[i] == udp->dest)
 			return 1;
 	}
 	return 0;
+}
+
+static inline void add_ignored_ip(const char *ip)
+{
+	add_ip_to_list(ip, global.ignored_ip, &global.ignored_ip_count);
+	fprintf(stderr, "Will ignore '%s/%d'\n",
+		ipv4_as_str(global.ignored_ip[global.ignored_ip_count - 1].ip),
+		global.ignored_ip[global.ignored_ip_count - 1].bits);
+}
+
+static inline int is_ignored_ip(ipv4_addr_t ip)
+{
+	return ip_in_list(ip, global.ignored_ip, global.ignored_ip_count);
+}
+
+static inline void add_tracked_ip(const char *ip)
+{
+	add_ip_to_list(ip, global.tracked_ip, &global.tracked_ip_count);
+	fprintf(stderr, "Will watch '%s/%d'\n",
+		ipv4_as_str(global.tracked_ip[global.tracked_ip_count - 1].ip),
+		global.tracked_ip[global.tracked_ip_count - 1].bits);
+}
+
+static inline int is_tracked_ip(ipv4_addr_t ip)
+{
+	return ip_in_list(ip, global.tracked_ip, global.tracked_ip_count);
 }
 
 static inline int mac_equal(const void *mac1, const void *mac2)
@@ -128,51 +276,47 @@ static inline int mac_equal(const void *mac1, const void *mac2)
 	return	p1[0] == p2[0] && p1[1] == p2[1] && p1[2] == p2[2];
 }
 
+static inline int mac_starts_with(const void *mac1, const uint8_t mac2[], size_t octets)
+{
+	const uint8_t *mac = mac1;
+	size_t i;
+
+	for (i = 0; i < octets; i++) {
+		if (mac[i] != mac2[i])
+			return 0;
+	}
+	return 1;
+}
+
+/* parse hex-colon 6-bytes Ethernet MAC address notation */
 static int eth_pton(const char *mac, eth_mac_t addr)
 {
-	int i = 0, j = 0, o = 0;
+	int i = 0, n = 0, octet = 0;
 
 	for (;;) {
-		int c = tolower(mac[i++]);
-		switch (c) {
-		case '\0':
-			return (j == 6) ? 1 : 0;
-		case ':':
-			if (j > 5)
-				return 0;
-			if (o > 255)
-				return 0;
-			addr[j++] = o & 0xff;
-			o = 0;
-			continue;
-		case '0':
-		case '1':
-		case '2':
-		case '3':
-		case '4':
-		case '5':
-		case '6':
-		case '7':
-		case '8':
-		case '9':
-			if (j > 5)
-				return 0;
-			o = (o << 4) | (c - '0');
-			continue;
-		case 'a':
-		case 'b':
-		case 'c':
-		case 'd':
-		case 'e':
-		case 'f':
-			if (j > 5)
-				return 0;
-			o = (o << 4) | (c - 'a');
-			continue;
-		default:
+		int c = mac[i++];
+
+		if (c == '\0') {
+			if (n == 5) {
+				addr[n] = octet;
+				return 1;
+			}
 			return 0;
-			break;
 		}
+		if (c == ':') {
+			if (n > 5)
+				return 0;
+			addr[n++] = octet;
+			octet = 0;
+			continue;
+		}
+		if (isxdigit(c)) {
+			octet = (octet << 4) | (c - (isdigit(c) ? '0' : 'a'));
+			if (octet < 0 || octet > 255)
+				return 0;
+			continue;
+		}
+		return 0;
 	}
 }
 
@@ -189,7 +333,7 @@ static void add_ignored_mac(const char *mac)
 		memcpy(global.ignored_mac[global.ignored_mac_count++], addr, sizeof(addr));
 		return;
 	case 0:
-		fprintf(stderr, "Error: '%s' is not valid IPv4 address\n", mac);
+		fprintf(stderr, "Error: '%s' is not a valid Ethernet MAC address\n", mac);
 		exit(EXIT_FAILURE);
 	case -1:
 		perror("inet_pton");
@@ -211,6 +355,60 @@ static inline int is_ignored_mac(const void *mac)
 	return 0;
 }
 
+static void add_tracked_mac(const char *mac)
+{
+	eth_mac_t addr;
+	int ret = eth_pton(mac, addr);
+
+	if (global.tracked_mac_count >= MAX_BAD_IP)
+		return;
+
+	switch (ret) {
+	case 1:
+		memcpy(global.tracked_mac[global.tracked_mac_count++], addr, sizeof(addr));
+		return;
+	case 0:
+		fprintf(stderr, "Error: '%s' is not a valid Ethernet MAC address\n", mac);
+		exit(EXIT_FAILURE);
+	case -1:
+		perror("inet_pton");
+		exit(EXIT_FAILURE);
+	default:
+		fprintf(stderr, "Error: inet_pton returned %d\n", ret);
+		exit(EXIT_FAILURE);
+	}
+}
+
+static inline int is_mcast_mac(const void *mac)
+{
+	static const uint8_t mcast_pfx1[] = { 0x01, 0x80, 0xc2 };
+	static const uint8_t mcast_pfx2[] = { 0x01, 0x00, 0x5e };
+
+	return	mac_starts_with(mac, mcast_pfx1, 3) ||
+		mac_starts_with(mac, mcast_pfx2, 3);
+}
+
+static inline int is_mcast_eth(const void *packet)
+{
+	const struct ether_header *eh = packet;
+
+	return	is_mcast_mac(eh->ether_dhost);
+}
+
+static inline int is_tracked_mac(const void *mac)
+{
+	int i;
+
+	if (parm.interesting && is_mcast_mac(mac))
+		return 1;
+
+	for (i = 0; i < global.tracked_mac_count; i++) {
+		if (mac_equal(mac, global.tracked_mac[i]))
+			return 1;
+	}
+	return 0;
+}
+
 const uint16_t lldp_type = 0x88cc;
 
 const eth_mac_t lldp_mac1 = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x00 };
@@ -227,22 +425,188 @@ static int is_lldp(const void *packet)
 		mac_equal(eh->ether_dhost, lldp_mac3);
 }
 
-static void ipv4_to_str(ipv4_addr_t ip, char *s, size_t size)
-{
-	struct sockaddr_storage their_addr = {};
+const eth_mac_t bpdu_mac1 = { 0x01, 0x80, 0xc2, 0x00, 0x00, 0x00 };
+const eth_mac_t bpdu_mac2 = { 0x01, 0x00, 0x0c, 0xcc, 0xcc, 0xcd };
 
-	((struct sockaddr_in *)&their_addr)->sin_addr.s_addr = ip;
-	inet_ntop(AF_INET, &((struct sockaddr_in*)&their_addr)->sin_addr, s, size);
-}
+struct bpdu {
+	uint16_t protocol; /* 0 = IEEE 802.1D */
+	uint8_t version_id; /* 0=Config/TCN, 2=RST, 3=MSTP, 4=SPT */
+	uint8_t type; /* 0=Config, 0x80=TCN, 0x02=RST */
+	/* TCNs have no following fields */
+	union {
+		uint8_t value;
+		struct {
+			uint8_t tc : 1;
+			uint8_t proposal : 1;
+			uint8_t port_role : 2;
+			uint8_t learning : 1;
+			uint8_t forwarding : 1;
+			uint8_t agreement : 1;
+			uint8_t tc_ack : 1;
+		} bit;
+	} flags;
+	union {
+		uint64_t value;
+		struct {
+			uint64_t prio : 4;
+			uint64_t sysidx : 12;
+			uint64_t mac : 48;
+		} root_bridge;
+	} root_id;
+	uint32_t root_path_cost;
+	union {
+		uint64_t value;
+		struct {
+			uint64_t prio : 4;
+			uint64_t sysidx : 12;
+			uint64_t mac : 48;
+		} root_bridge;
+	} bridge_id;
+	uint16_t port_id;
+	uint16_t msg_age;
+	uint16_t max_age;
+	uint16_t hello_time;
+	uint16_t fwd_delay;
+	uint8_t ver1_len;
+	uint16_t ver3_len;
+};
 
-static inline int ignored_packet(void *packet)
+static int is_bpdu(const void *packet)
 {
 	const struct ether_header *eh = packet;
-	struct iphdr *ip = (struct iphdr *)
+
+	return mac_equal(eh->ether_dhost, bpdu_mac1) ||
+		mac_equal(eh->ether_dhost, bpdu_mac2);
+}
+
+static inline int tracked_packet(const void *packet)
+{
+	const struct ether_header *eh = packet;
+	const struct iphdr *ip = (struct iphdr *)
 		(packet + sizeof(struct ether_header));
 
-	if (is_ignored_ip(ip->saddr) || is_ignored_mac(eh->ether_shost)) return 1;
+	return	is_tracked_ip(ip->saddr) || is_tracked_mac(eh->ether_shost) ||
+		is_tracked_ip(ip->daddr) || is_tracked_mac(eh->ether_dhost);
+}
+
+static int is_UPnP_ssdp(const void *packet);
+
+static inline int ignored_packet(const void *packet)
+{
+	const struct ether_header *eh = packet;
+	const struct iphdr *ip = (struct iphdr *)
+		(packet + sizeof(struct ether_header));
+
+	if (tracked_packet(packet))
+		return 0;
+
+	if (parm.interesting) {
+		if (is_UPnP_ssdp(packet))
+			return 1;
+	}
+
+	return	is_ignored_ip(ip->saddr) || is_ignored_mac(eh->ether_shost) ||
+		is_ignored_ip(ip->daddr) || is_ignored_mac(eh->ether_dhost);
+}
+
+static inline int match_cidr(ipv4_addr_t ip, uint8_t o1, uint8_t o2, uint8_t o3, uint8_t o4, int bits)
+{
+	ipv4_addr_t mask = htonl((o1 << 24) | (o2 << 16) | (o3 << 8) | o4);
+
+	bits = 32 - bits;
+
+	return (ip << bits) == (mask << bits);
+}
+
+static inline int ipv4_equal(ipv4_addr_t ip, uint8_t o1, uint8_t o2, uint8_t o3, uint8_t o4)
+{
+	ipv4_addr_t test = htonl((o1 << 24) | (o2 << 16) | (o3 << 8) | o4);
+
+	return ip == test;
+}
+
+static int is_mcast_IPv4(const void *packet)
+{
+	const struct iphdr *ip = (struct iphdr *)
+		(packet + sizeof(struct ether_header));
+
+	/* https://tools.ietf.org/html/draft-ietf-mboned-ipv4-mcast-unusable-01 */
+	if (match_cidr(ip->daddr, 224,0,0,0, 4)) /* 224/4 */
+		return 1;
 	return 0;
+}
+
+static int is_pvt_IPv4(const void *packet)
+{
+	const struct iphdr *ip = (struct iphdr *)
+		(packet + sizeof(struct ether_header));
+
+	/* RFC 1918 */
+	if (	match_cidr(ip->saddr, 10,0,0,0, 8)	/* 10.0.0.0/8 */ ||
+		match_cidr(ip->saddr, 172,16,0,0, 12)	/* 172.16.0.0/12 */ ||
+		match_cidr(ip->saddr, 192,168,0,0, 16)	/* 192.168.0.0/16 */
+	)
+		return 1;
+	return 0;
+}
+
+static int is_ll_IPv4(const void *packet)
+{
+	const struct iphdr *ip = (struct iphdr *)
+		(packet + sizeof(struct ether_header));
+
+	/* https://tools.ietf.org/html/draft-ietf-mboned-ipv4-mcast-unusable-01 */
+	if (	(ip->saddr == 0)			/* 0.0.0.0/0 */ ||
+		match_cidr(ip->saddr, 196,254,0,0, 16)	/* 196.254.0.0/16 */
+	)
+		return 1;
+	return 0;
+}
+
+static int is_loopback_IPv4(const void *packet)
+{
+	const struct iphdr *ip = (struct iphdr *)
+		(packet + sizeof(struct ether_header));
+
+	/* https://tools.ietf.org/html/draft-ietf-mboned-ipv4-mcast-unusable-01 */
+	if (match_cidr(ip->saddr, 127,0,0,0, 8))	/* 127.0.0.0/8 */
+		return 1;
+	return 0;
+}
+
+static int is_doc_IPv4(const void *packet)
+{
+	const struct iphdr *ip = (struct iphdr *)
+		(packet + sizeof(struct ether_header));
+
+	/* https://tools.ietf.org/html/draft-ietf-mboned-ipv4-mcast-unusable-01 */
+	if (match_cidr(ip->saddr, 192,0,2,0, 24))	/* 192.0.2.0/24 */
+		return 1;
+	return 0;
+}
+
+static inline int is_pxe(const void *packet)
+{
+	const struct ether_header *eh = packet;
+	const struct iphdr *ip = (struct iphdr *)
+		(packet + sizeof(struct ether_header));
+	
+	return (ip->saddr == INADDR_ANY &&
+		ip->daddr == INADDR_BROADCAST &&
+		mac_equal(eh->ether_dhost, broadcast_mac)
+	);
+}
+
+static int is_UPnP_ssdp(const void *packet)
+{
+	const struct iphdr *ip = (struct iphdr *)
+		(packet + sizeof(struct ether_header));
+	const struct udphdr *udp = (struct udphdr *)
+		(packet + sizeof(struct iphdr) + sizeof(struct ether_header));
+
+	return	ipv4_equal(ip->daddr, 239,255,255,250) &&
+		ip->protocol == IPPROTO_UDP &&
+		ntohs(udp->dest) == 1900;
 }
 
 #define MAX_PKT_TAGS 32
@@ -258,25 +622,68 @@ static inline void print_tags(FILE *f)
 	}
 }
 
-static inline int is_pxe(void *packet)
+#define ADD_TAG(tag)				\
+	if (last_tag < MAX_PKT_TAGS) {		\
+		tags[last_tag++] = tag;		\
+	}
+
+#define SET_TAG(test,tag)				\
+	if (last_tag < MAX_PKT_TAGS && test(packet)) {	\
+	    tags[last_tag++] = tag;			\
+	}
+
+static void tag_packet(const void *packet)
 {
-	const struct ether_header *eh = packet;
-	struct iphdr *ip = (struct iphdr *)
-		(packet + sizeof(struct ether_header));
-	
-	return (ip->saddr == INADDR_ANY &&
-		ip->daddr == INADDR_BROADCAST &&
-		mac_equal(eh->ether_dhost, broadcast_mac)
-	);
+	last_tag = 0;
+
+	SET_TAG(is_bpdu, "BPDU");
+	SET_TAG(is_lldp, "LLPD");
+	SET_TAG(is_pxe, "PXE");
+	SET_TAG(is_mcast_eth, "ETH.MCAST");
+	SET_TAG(is_pvt_IPv4, "IP.PVT");
+	SET_TAG(is_ll_IPv4, "IP.LL");
+	SET_TAG(is_loopback_IPv4, "IP.LB");
+	SET_TAG(is_doc_IPv4, "IP.DOC");
+	if (is_mcast_IPv4(packet)) {
+		const struct iphdr *ip = (struct iphdr *)
+			(packet + sizeof(struct ether_header));
+		uint32_t a = ntohl(ip->daddr);
+
+		ADD_TAG("IP.MCAST");
+		if (match_cidr(a, 239,0,0,0, 8)) ADD_TAG("MCAST.APP");
+		if (match_cidr(a, 232,0,0,0, 8)) ADD_TAG("MCAST.SS");
+		if (	match_cidr(a, 233,0,0,0, 24) ||
+			match_cidr(a, 233,128,0,0, 24)
+		)	ADD_TAG("MCAST.IANA");
+		if (is_UPnP_ssdp(packet)) ADD_TAG("UPnP");
+	}
+}
+
+static inline int zero16(const void *data)
+{
+	const uint64_t *p = data;
+
+	return p[0] == 0 && p[1] == 0;
 }
 
 static void dump(FILE *f, const void *data, size_t size)
 {
 	const uint8_t *D = data;
 	size_t row, col;
+	int zcnt = 0;
 
 	for (row = 0; (row * 16) < size; row++) {
 		const size_t row_offset = row * 16;
+
+		if (row && row_offset + 16 < size && zero16(D + row_offset)) {
+			zcnt++;
+			continue;
+		}
+
+		if (zcnt) {
+			fprintf(f, "** zero bytes skipped: %d\n", zcnt * 16);
+			zcnt = 0;
+		}
 
 		fprintf(f, "%08lx", row_offset);
 		for (col = 0; col < 16; col++) {
@@ -547,29 +954,25 @@ static void print_eth(FILE *f, void *packet, ssize_t psize)
 	}
 }
 
+static void print_pxe(void *packet, ssize_t psize)
+{
+	const struct ether_header *eh = packet;
+
+	if (!is_pxe(packet))
+		return;
+
+	printf("PXE%lu=%s\n", ++global.total_printed,
+		ether_ntoa((const struct ether_addr *) eh->ether_shost));
+
+	if (parm.dump_packet)
+		dump(stdout, packet, psize);
+}
+
 static void print_packet(void *packet, ssize_t psize)
 {
-	if (parm.pxe_only) {
-		if (is_pxe(packet)) {
-			const struct ether_header *eh = packet;
-
-			printf("PXE%lu=%s\n", ++global.total_printed,
-				ether_ntoa((const struct ether_addr *) eh->ether_shost));
-			if (parm.dump_packet)
-				dump(stdout, packet, psize);
-		}
-		return;
-	}
-
 	global.total_printed++;
-	last_tag = 0;
 
-	if (last_tag < MAX_PKT_TAGS) {
-		if (is_lldp(packet))
-			tags[last_tag++] = "LLPD";
-		if (is_pxe(packet))
-			tags[last_tag++] = "PXE";
-	}
+	tag_packet(packet);
 
 	printf("%lu", psize);
 	print_eth(stdout, packet, psize);
@@ -704,6 +1107,10 @@ static void auto_exclude_ssh(void)
 	char c, *p, *var = getenv("SSH_CLIENT") ?: getenv("SSH_CONNECTION");
 
 	if (!var) {
+		if (!parm.auto_exclude) {
+			fprintf(stderr, "No SSH detected.\n");
+			return;
+		}
 		fprintf(stderr, "Oops: cannot detect SSH\n");
 		if (getenv("SUDO_COMMAND"))
 			fprintf(stderr, "Use 'sudo -E' to preserve environment\n");
@@ -725,23 +1132,12 @@ static void auto_exclude_ssh(void)
 	*p = c;
 }
 
-static int a2i(char *s)
+static int good_packet(const void *packet)
 {
-	char *p;
-	long int r;
-
-	errno = 0;
-	r = strtol(s, &p, 10);
-	if (errno) {
-		perror("strtol");
-		exit(EXIT_FAILURE);
+	if (parm.only) {
+		return tracked_packet(packet) && !ignored_port(packet);
 	}
-	if (r == 0L && p == s) {
-		fprintf(stderr, "Invalid decimal value '%s'.\n", s);
-		exit(EXIT_FAILURE);
-	}
-
-	return (int) r;
+	return !ignored_packet(packet) && !ignored_port(packet);
 }
 
 static void help(const char *argv0)
@@ -751,13 +1147,18 @@ static void help(const char *argv0)
 		"Valid options:\n"
 		"-I <interface>\t-- specify interface name, mandatory\n"
 		"-a\t\t-- don't automagically filter out SSH originator's IP\n"
-		"-x <IP>\t\t-- filter out <IP> (IPv4 dotted quad)\n"
+		"-x <IP>[/<bits>]\t-- filter out <IP> (IPv4 dotted quad) or subnet of <bits> prefix\n"
 		"-X <MAC>\t-- filter out <MAC> (hex-colon 6 bytes)\n"
+		"-y <IP>[/<bits>]\t-- watch <IP> (IPv4 dotted quad) or subnet of <bits> prefix\n"
+		"-Y <MAC>\t-- watch <MAC> (hex-colon 6 bytes)\n"
 		"-p\t\t-- detect PXE boot frames only\n"
 		"-P\t\t-- promiscous mode\n"
 		"-d\t\t-- print dump of packets\n"
 		"-n\t\t-- don't ignore local traffic (null MACs)\n"
 		"-c <N>\t\t-- quit after printing <N> packets\n"
+		"-i\t\t-- print \"interesting\" packets\n"
+		"-o\t\t-- print only selected packets\n"
+		"-N <P>[,<P>...]\t-- don't print packets for service/port <P>\n"
 		"\n"
 		"You'd normally run it as 'sudo -E %s -I %s'\n"
 		"\n",
@@ -770,7 +1171,7 @@ extern int getopt(int argc, char * const argv[], const char *optstring);
 extern char *optarg;
 extern int optind, opterr, optopt;
 
-const static char options[]="hI:x:X:apPdnc:";
+const static char options[]="hI:x:X:apPdnc:y:Y:ioN:";
 
 int main(int argc, char *argv[], char **envp)
 {
@@ -784,6 +1185,19 @@ int main(int argc, char *argv[], char **envp)
 
 	while ((opt = getopt(argc, argv, options)) != -1) {
 		switch (opt) {
+		case 'N':
+			parm.no_srv = 1;
+			fprintf(stderr, "Won't print ports/services:\n");
+			ignore_ports(optarg);
+			break;
+		case 'o':
+			parm.only = 1;
+			fprintf(stderr, "Will print only selected\n");
+			break;
+		case 'i':
+			parm.interesting = 1;
+			fprintf(stderr, "Will print interesting\n");
+			break;
 		case 'c':
 			parm.max_packets = a2i(optarg);
 			fprintf(stderr, "Won't ignore null MACs\n");
@@ -817,6 +1231,12 @@ int main(int argc, char *argv[], char **envp)
 		case 'X':
 			add_ignored_mac(optarg);
 			break;
+		case 'y':
+			add_tracked_ip(optarg);
+			break;
+		case 'Y':
+			add_tracked_mac(optarg);
+			break;
 		case 'h':
 		default:
 			help(argv[0]);
@@ -826,6 +1246,21 @@ int main(int argc, char *argv[], char **envp)
 	if (!parm.ifName_set) {
 		fprintf(stderr, "No interface given.\n");
 		exit(EXIT_FAILURE);
+	}
+
+	if (parm.interesting) {
+		static const char *interesting_mac[] = {
+			/* all "01:80:c2:xx:xx:xx" are already "interesting" */
+			"01:00:0c:cc:cc:cd",
+			"ff:ff:ff:ff:ff:ff",
+			NULL
+		};
+		int i;
+
+		auto_exclude_ssh();
+		for (i = 0; interesting_mac[i]; i++)
+			add_tracked_mac(interesting_mac[i]);
+
 	}
 
 	if (parm.auto_exclude)
@@ -856,8 +1291,15 @@ int main(int argc, char *argv[], char **envp)
 	while (global.do_the_job) {
 		numbytes = recvfrom(sockfd, buf, BUF_SIZ, 0, NULL, NULL);
 		global.total_count++;
-		if (!ignored_packet(buf))
+
+		if (parm.pxe_only) {
+			print_pxe(buf, numbytes);
+			continue;
+		}
+
+		if (good_packet(buf))
 			print_packet(buf, numbytes);
+
 		if (parm.max_packets && global.total_printed >= parm.max_packets)
 			break;
 	}
