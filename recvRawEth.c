@@ -46,6 +46,8 @@ static struct {
 	int max_packets;
 	int interesting;
 	int only;
+	int no_ip;
+	int do_ip;
 	int no_srv;
 	int do_srv;
 } parm = {
@@ -140,15 +142,20 @@ static char *ipv4_as_str(ipv4_addr_t ip)
 	return tmp;
 }
 
+static inline int ip4_match(ipv4_addr_t ip1, ipv4_addr_t ip2, int bits)
+{
+	uint32_t a = htonl(ip1) >> (32 - bits);
+	uint32_t b = htonl(ip2) >> (32 - bits);
+
+	return (a == b);
+}
+
 static inline int ip_in_list(ipv4_addr_t ip, const struct ipv4_cidr *list, int list_size)
 {
 	int i;
 
 	for (i = 0; i < list_size; i++) {
-		uint32_t a = ip << (32 - list[i].bits);
-		uint32_t b = list[i].ip << (32 - list[i].bits);
-
-		if (a == b)
+		if (ip4_match(ip, list[i].ip, list[i].bits))
 			return 1;
 	}
 	return 0;
@@ -226,19 +233,31 @@ static void add_ports_to_list(char *arg, unsigned short *list, int *list_size)
 	}
 }
 
-static int port_in_list(const void *packet, unsigned short *list, int list_size)
+static int port_in_list(const void *packet, const unsigned short *list, int list_size)
 {
 	const struct iphdr *ip = (struct iphdr *)
 		(packet + sizeof(struct ether_header));
-	const struct udphdr *udp = (struct udphdr *)
-		(packet + sizeof(struct iphdr) + sizeof(struct ether_header));
 	int i;
+	unsigned short src, dst;
 
-	if (ip->protocol != IPPROTO_TCP && ip->protocol != IPPROTO_UDP)
+	switch (ip->protocol) {
+	case IPPROTO_TCP:
+	case IPPROTO_UDP: {
+		/* these protocols have (almost the same) ports */
+		const struct udphdr *udp = (struct udphdr *)
+			(packet + sizeof(struct iphdr) + sizeof(struct ether_header));
+
+		src = udp->source;
+		dst = udp->dest;
+		break;
+		}
+	default:
+		/* cannot handle */
 		return 0;
+	}
 
 	for (i = 0; i < list_size; i++) {
-		if (list[i] == udp->source || list[i] == udp->dest)
+		if (list[i] == src || list[i] == dst)
 			return 1;
 	}
 	return 0;
@@ -535,20 +554,14 @@ static inline int ignored_packet(const void *packet)
 		is_ignored_ip(ip->daddr) || is_ignored_mac(eh->ether_dhost);
 }
 
-static inline int match_cidr(ipv4_addr_t ip, uint8_t o1, uint8_t o2, uint8_t o3, uint8_t o4, int bits)
+static inline int quad2ip(uint8_t o1, uint8_t o2, uint8_t o3, uint8_t o4)
 {
-	ipv4_addr_t mask = htonl((o1 << 24) | (o2 << 16) | (o3 << 8) | o4);
-
-	bits = 32 - bits;
-
-	return (ip << bits) == (mask << bits);
+	return htonl((o1 << 24) | (o2 << 16) | (o3 << 8) | o4);
 }
 
-static inline int ipv4_equal(ipv4_addr_t ip, uint8_t o1, uint8_t o2, uint8_t o3, uint8_t o4)
+static inline int match_cidr(ipv4_addr_t ip, uint8_t o1, uint8_t o2, uint8_t o3, uint8_t o4, int bits)
 {
-	ipv4_addr_t test = htonl((o1 << 24) | (o2 << 16) | (o3 << 8) | o4);
-
-	return ip == test;
+	return ip4_match(ip, quad2ip(o1, o2, o3, o4), bits);
 }
 
 static int is_mcast_IPv4(const void *packet)
@@ -630,7 +643,7 @@ static int is_UPnP_ssdp(const void *packet)
 	const struct udphdr *udp = (struct udphdr *)
 		(packet + sizeof(struct iphdr) + sizeof(struct ether_header));
 
-	return	ipv4_equal(ip->daddr, 239,255,255,250) &&
+	return	ip->daddr == quad2ip(239,255,255,250) &&
 		ip->protocol == IPPROTO_UDP &&
 		ntohs(udp->dest) == 1900;
 }
@@ -673,13 +686,12 @@ static void tag_packet(const void *packet)
 	if (is_mcast_IPv4(packet)) {
 		const struct iphdr *ip = (struct iphdr *)
 			(packet + sizeof(struct ether_header));
-		uint32_t a = ntohl(ip->daddr);
 
 		ADD_TAG("IP.MCAST");
-		if (match_cidr(a, 239,0,0,0, 8)) ADD_TAG("MCAST.APP");
-		if (match_cidr(a, 232,0,0,0, 8)) ADD_TAG("MCAST.SS");
-		if (	match_cidr(a, 233,0,0,0, 24) ||
-			match_cidr(a, 233,128,0,0, 24)
+		if (match_cidr(ip->daddr, 239,0,0,0, 8)) ADD_TAG("MCAST.APP");
+		if (match_cidr(ip->daddr, 232,0,0,0, 8)) ADD_TAG("MCAST.SS");
+		if (	match_cidr(ip->daddr, 233,0,0,0, 24) ||
+			match_cidr(ip->daddr, 233,128,0,0, 24)
 		)	ADD_TAG("MCAST.IANA");
 		if (is_UPnP_ssdp(packet)) ADD_TAG("UPnP");
 	}
@@ -1163,7 +1175,8 @@ static void auto_exclude_ssh(void)
 static int good_packet(const void *packet)
 {
 	if (parm.only) {
-		return tracked_packet(packet) && tracked_port(packet);
+		return (!parm.do_ip || tracked_packet(packet)) && 
+			(!parm.do_srv || tracked_port(packet));
 	}
 	return !ignored_packet(packet) && !ignored_port(packet);
 }
@@ -1260,15 +1273,19 @@ int main(int argc, char *argv[], char **envp)
 			strncpy(global.ifName, optarg, sizeof(global.ifName) - 1);
 			break;
 		case 'x':
+			parm.no_ip = 1;
 			add_ignored_ip(optarg);
 			break;
 		case 'X':
+			fprintf(stderr, "Won't print for MAC %s\n", optarg);
 			add_ignored_mac(optarg);
 			break;
 		case 'y':
+			parm.do_ip = 1;
 			add_tracked_ip(optarg);
 			break;
 		case 'Y':
+			fprintf(stderr, "Will print for MAC %s\n", optarg);
 			add_tracked_mac(optarg);
 			break;
 		case 'h':
