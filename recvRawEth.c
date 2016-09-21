@@ -47,6 +47,7 @@ static struct {
 	int interesting;
 	int only;
 	int no_srv;
+	int do_srv;
 } parm = {
 	.auto_exclude = 1,
 };
@@ -94,10 +95,12 @@ struct {
 
 	unsigned short ignored_ports[MAX_BAD_IP];
 	int ignored_port_count;
+
+	unsigned short tracked_ports[MAX_BAD_IP];
+	int tracked_port_count;
 } global = {
 	.ifName = DEFAULT_IF,
 	.ignored_mac_count = 1, /* null MAC is always ignored */
-
 };
 
 const eth_mac_t broadcast_mac = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
@@ -185,11 +188,11 @@ static void add_ip_to_list(const char *ip, struct ipv4_cidr *list, int *list_siz
 	}
 }
 
-static void ignore_ports(char *arg)
+static void add_ports_to_list(char *arg, unsigned short *list, int *list_size)
 {
 	char *q, *p = arg;
 
-	while (global.ignored_port_count < MAX_BAD_IP) {
+	while (*list_size < MAX_BAD_IP) {
 		long int r;
 
 		errno = 0;
@@ -213,7 +216,7 @@ static void ignore_ports(char *arg)
 		}
 
 		/* r = port number */
-		global.ignored_ports[global.ignored_port_count++] = htons(r);
+		list[(*list_size)++] = htons(r);
 		fprintf(stderr, "\tport %lu\n", r);
 
 		if (!q || !*q) break;
@@ -223,7 +226,7 @@ static void ignore_ports(char *arg)
 	}
 }
 
-static int ignored_port(const void *packet)
+static int port_in_list(const void *packet, unsigned short *list, int list_size)
 {
 	const struct iphdr *ip = (struct iphdr *)
 		(packet + sizeof(struct ether_header));
@@ -234,12 +237,35 @@ static int ignored_port(const void *packet)
 	if (ip->protocol != IPPROTO_TCP && ip->protocol != IPPROTO_UDP)
 		return 0;
 
-	for (i = 0; i < global.ignored_port_count; i++) {
-		if (	global.ignored_ports[i] == udp->source ||
-			global.ignored_ports[i] == udp->dest)
+	for (i = 0; i < list_size; i++) {
+		if (list[i] == udp->source || list[i] == udp->dest)
 			return 1;
 	}
 	return 0;
+}
+
+static inline void ignore_ports(char *arg)
+{
+	add_ports_to_list(arg, global.ignored_ports, &global.ignored_port_count);
+}
+
+static inline int ignored_port(const void *packet)
+{
+	if (!parm.no_srv)
+		return 0;
+	return port_in_list(packet, global.ignored_ports, global.ignored_port_count);
+}
+
+static inline void track_ports(char *arg)
+{
+	add_ports_to_list(arg, global.tracked_ports, &global.tracked_port_count);
+}
+
+static inline int tracked_port(const void *packet)
+{
+	if (!parm.do_srv)
+		return 1;
+	return port_in_list(packet, global.tracked_ports, global.tracked_port_count);
 }
 
 static inline void add_ignored_ip(const char *ip)
@@ -1021,16 +1047,19 @@ static void get_local_addrs(int sockfd, const char *ifName, ipv4_addr_t *ip, eth
 static inline void print_stat(void)
 {
 	struct timeval tv;
+	time_t dt;
+
 	gettimeofday(&tv, NULL);
+	dt = tv.tv_sec - global.t0.tv_sec;
 
 	fprintf(stderr, "\nLocal IP '%s' on '%s' [%s]\n",
 		global.local_ip_str, global.ifName, 
 		ether_ntoa((const struct ether_addr *) global.local_mac));
 	fprintf(stderr, "seconds spent        : %lu\n"
-			"total packets seen   : %lu (%lu pps)\n"
+			"total packets seen   : %lu (%lu%s pps)\n"
 			"total packets printed: %lu\n",
-			tv.tv_sec - global.t0.tv_sec,
-			global.total_count, global.total_count / (tv.tv_sec - global.t0.tv_sec),
+			dt,
+			global.total_count, global.total_count / (dt ? dt : 1), dt ? "" : "+",
 			global.total_printed);
 }
 
@@ -1043,7 +1072,6 @@ static void on_sigint(int arg)
 static void on_sigquit(int arg)
 {
 	fprintf(stderr, "\nQUIT\n");
-	print_stat();
 	global.do_the_job = 0;
 }
 
@@ -1135,7 +1163,7 @@ static void auto_exclude_ssh(void)
 static int good_packet(const void *packet)
 {
 	if (parm.only) {
-		return tracked_packet(packet) && !ignored_port(packet);
+		return tracked_packet(packet) && tracked_port(packet);
 	}
 	return !ignored_packet(packet) && !ignored_port(packet);
 }
@@ -1147,18 +1175,19 @@ static void help(const char *argv0)
 		"Valid options:\n"
 		"-I <interface>\t-- specify interface name, mandatory\n"
 		"-a\t\t-- don't automagically filter out SSH originator's IP\n"
-		"-x <IP>[/<bits>]\t-- filter out <IP> (IPv4 dotted quad) or subnet of <bits> prefix\n"
+		"-x <IP>[/<W>]\t-- filter out <IP> (IPv4 dotted quad) or subnet of <W> prefix bits\n"
 		"-X <MAC>\t-- filter out <MAC> (hex-colon 6 bytes)\n"
-		"-y <IP>[/<bits>]\t-- watch <IP> (IPv4 dotted quad) or subnet of <bits> prefix\n"
+		"-y <IP>[/<W>]\t-- watch <IP> (IPv4 dotted quad) or subnet of <W> prefix bits\n"
 		"-Y <MAC>\t-- watch <MAC> (hex-colon 6 bytes)\n"
 		"-p\t\t-- detect PXE boot frames only\n"
 		"-P\t\t-- promiscous mode\n"
 		"-d\t\t-- print dump of packets\n"
-		"-n\t\t-- don't ignore local traffic (null MACs)\n"
+		"-l\t\t-- don't ignore local traffic (null MACs)\n"
 		"-c <N>\t\t-- quit after printing <N> packets\n"
 		"-i\t\t-- print \"interesting\" packets\n"
 		"-o\t\t-- print only selected packets\n"
 		"-N <P>[,<P>...]\t-- don't print packets for service/port <P>\n"
+		"-n <P>[,<P>...]\t-- do print packets for service/port <P>\n"
 		"\n"
 		"You'd normally run it as 'sudo -E %s -I %s'\n"
 		"\n",
@@ -1171,7 +1200,7 @@ extern int getopt(int argc, char * const argv[], const char *optstring);
 extern char *optarg;
 extern int optind, opterr, optopt;
 
-const static char options[]="hI:x:X:apPdnc:y:Y:ioN:";
+const static char options[]="hI:x:X:apPdc:y:Y:oN:n:i";
 
 int main(int argc, char *argv[], char **envp)
 {
@@ -1185,9 +1214,14 @@ int main(int argc, char *argv[], char **envp)
 
 	while ((opt = getopt(argc, argv, options)) != -1) {
 		switch (opt) {
+		case 'n':
+			parm.do_srv = 1;
+			fprintf(stderr, "Will print ports/services (%s):\n", optarg);
+			track_ports(optarg);
+			break;
 		case 'N':
 			parm.no_srv = 1;
-			fprintf(stderr, "Won't print ports/services:\n");
+			fprintf(stderr, "Won't print ports/services (%s):\n", optarg);
 			ignore_ports(optarg);
 			break;
 		case 'o':
@@ -1202,7 +1236,7 @@ int main(int argc, char *argv[], char **envp)
 			parm.max_packets = a2i(optarg);
 			fprintf(stderr, "Won't ignore null MACs\n");
 			break;
-		case 'n':
+		case 'l':
 			global.ignored_mac_count = 0;
 			fprintf(stderr, "Won't ignore null MACs\n");
 			break;
@@ -1309,5 +1343,6 @@ int main(int argc, char *argv[], char **envp)
 
 	close(sockfd);
 	fprintf(stderr, "done\n");
+	print_stat();
 	return 0;
 }
