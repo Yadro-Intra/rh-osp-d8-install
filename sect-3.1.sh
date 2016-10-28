@@ -3,8 +3,6 @@ echo 'Chapter 3. Planning your Overcloud'>&2
 echo '3.1. Planning Node Deployment Roles'>&2
 echo ''>&2
 
-choice=choice.my
-
 declare -A roles=(
 	[Controller]="Provides key services for controlling your environment. This includes the dashboard (horizon), authentication (keystone), image storage (glance), networking (neutron), orchestration (heat), and high availability services (if using more than one Controller node). A basic Red Hat OpenStack Platform environment requires at least one Controller node."
 	[Compute]="A physical server that acts as a hypervisor, and provides the processing capabilities required for running virtual machines in the environment. A basic Red Hat OpenStack Platform environment requires at least one Compute node."
@@ -98,6 +96,14 @@ get_numbers () {
 	explain Swift		$nSwf
 	explain Cinder		$nCnd
 }
+
+[ -w /etc/passwd ] && error 1 "Don't run me as root. User 'stack' instead."
+[ "$(id -nu)" = 'stack' ] || error 1 "Run me as user 'stack' please."
+
+cd ~stack || error $? "No home?"
+home=$(pwd)
+
+choice="$home/choice.my"
 
 get_numbers
 

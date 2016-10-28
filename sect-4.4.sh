@@ -78,6 +78,7 @@ rm -f "$smlst"
 repos_cur=/etc/yum.repos.d/redhat.repo
 repos_old=redhat.repo.save
 
+[ -e "$repos_cur" ] || { sudo touch "$repos_cur" || error $? "Cannot create '$repos_cur'."; }
 cp -v "$repos_cur" "$repos_old" || error $? "Cannot save '$repos_cur' to '$repos_old'."
 
 run sudo subscription-manager attach --pool="$pool_id" \
